@@ -246,4 +246,64 @@ mod tests {
         assert!(err.contains("could not remove"));
         assert!(err.contains("Stop other hcom processes"));
     }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn test_windows_reset_archive_handles_command_owned_live_connection() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+
+        let db = HcomDb::open().expect("failed to open test database");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "2026-09-04T00:00:00Z",
+                    "message",
+                    "test_instance",
+                    "{\"content\":\"test\"}"
+                ],
+            )
+            .expect("failed to insert test event");
+
+        let wal_path = hcom_dir.join("hcom.db-wal");
+        assert!(
+            wal_path.exists(),
+            "expected non-empty WAL database with active WAL sidecar"
+        );
+
+        // While the command-owned/live connection `db` remains open, attempt archive and clear.
+        // On Windows, SQLite holds an open handle preventing deletion.
+        let archive_result = archive_and_clear_db();
+
+        // When deletion fails due to the open handle, verify that the original
+        // database is not left in a partially deleted or corrupted state, and remains queryable.
+        if archive_result.is_err() {
+            let db_path = hcom_dir.join("hcom.db");
+            assert!(
+                db_path.exists(),
+                "original database file must remain present when deletion fails"
+            );
+            let fresh_conn = rusqlite::Connection::open(&db_path).expect(
+                "on-disk database must remain openable via fresh connection when deletion fails",
+            );
+            let event_count: i64 = fresh_conn
+                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                .expect("original on-disk database must remain readable when deletion fails");
+            assert_eq!(
+                event_count, 1,
+                "original database content must remain intact when deletion fails"
+            );
+        }
+
+        // Live connection must not prevent safe reset/archive.
+        // On Windows prior to fix, this fails (RED) because remove_database_files cannot
+        // remove the active database and WAL files while the connection handle is open.
+        let archive_path = archive_result
+            .expect("live command-owned database handle must not prevent safe reset/archive");
+        assert!(
+            archive_path.is_some(),
+            "expected non-empty database to be archived"
+        );
+    }
 }
