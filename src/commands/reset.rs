@@ -23,12 +23,12 @@ pub struct ResetArgs {
     pub target: Option<ResetTarget>,
 }
 
-pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
+pub fn cmd_reset(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) -> i32 {
     let target = args.target;
 
     // Confirmation gate: inside AI tools, require --go
     if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
-        super::reset_preview::print_reset_preview(target, db);
+        super::reset_preview::print_reset_preview(target, &db);
         return 0;
     }
 
@@ -43,7 +43,7 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     let stop_args = crate::commands::stop::StopArgs {
         targets: vec!["all".into()],
     };
-    exit_codes.push(crate::commands::stop::cmd_stop(db, &stop_args, ctx));
+    exit_codes.push(crate::commands::stop::cmd_stop(&db, &stop_args, ctx));
 
     // Stop relay daemon if running before clear
     let _ = crate::commands::daemon::daemon_stop();
@@ -51,11 +51,15 @@ pub fn cmd_reset(db: &HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>) ->
     // Clean temp files
     super::reset_ops::clean_temp_files();
 
+    // Explicitly release command-owned database connection before archive/clear.
+    // On Windows, SQLite's open file handle prevents deleting hcom.db, hcom.db-wal, and hcom.db-shm.
+    drop(db);
+
     // Archive and clear database
     let archive_exit =
         super::reset_ops::print_archive_result(super::reset_ops::archive_and_clear_db());
     if archive_exit != 0 {
-        exit_codes.push(archive_exit);
+        return archive_exit;
     }
 
     // For reset all: clear pidtrack before recovery can trigger

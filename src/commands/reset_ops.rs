@@ -272,38 +272,209 @@ mod tests {
             "expected non-empty WAL database with active WAL sidecar"
         );
 
-        // While the command-owned/live connection `db` remains open, attempt archive and clear.
-        // On Windows, SQLite holds an open handle preventing deletion.
-        let archive_result = archive_and_clear_db();
-
-        // When deletion fails due to the open handle, verify that the original
-        // database is not left in a partially deleted or corrupted state, and remains queryable.
-        if archive_result.is_err() {
-            let db_path = hcom_dir.join("hcom.db");
-            assert!(
-                db_path.exists(),
-                "original database file must remain present when deletion fails"
-            );
-            let fresh_conn = rusqlite::Connection::open(&db_path).expect(
-                "on-disk database must remain openable via fresh connection when deletion fails",
-            );
-            let event_count: i64 = fresh_conn
-                .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
-                .expect("original on-disk database must remain readable when deletion fails");
-            assert_eq!(
-                event_count, 1,
-                "original database content must remain intact when deletion fails"
-            );
-        }
-
-        // Live connection must not prevent safe reset/archive.
-        // On Windows prior to fix, this fails (RED) because remove_database_files cannot
-        // remove the active database and WAL files while the connection handle is open.
-        let archive_path = archive_result
-            .expect("live command-owned database handle must not prevent safe reset/archive");
-        assert!(
-            archive_path.is_some(),
-            "expected non-empty database to be archived"
+        // Command-owned handle flow: cmd_reset takes ownership of `db`, releases it,
+        // archives and clears the database, and bootstraps a fresh database.
+        let ctx = crate::shared::CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+        };
+        let reset_args = crate::commands::reset::ResetArgs { target: None };
+        let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
+        assert_eq!(
+            exit_code, 0,
+            "cmd_reset must succeed when command-owned handle is released"
         );
+
+        // 1. Archive is produced and readable
+        let archive_base = hcom_dir.join("archive");
+        assert!(archive_base.exists(), "archive directory must exist");
+        let mut archived_sessions = std::fs::read_dir(&archive_base)
+            .expect("must read archive dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("session-"))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            archived_sessions.len(),
+            1,
+            "expected exactly one archived session directory"
+        );
+        let session_dir = archived_sessions.pop().unwrap().path();
+        let archived_db_path = session_dir.join("hcom.db");
+        assert!(
+            archived_db_path.exists(),
+            "archived hcom.db file must exist"
+        );
+
+        // 2. Original event exists in archive
+        let archive_conn = rusqlite::Connection::open(&archived_db_path)
+            .expect("archived database must be queryable");
+        let archived_event_count: i64 = archive_conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message' AND instance = 'test_instance'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("must query archived events");
+        assert_eq!(
+            archived_event_count, 1,
+            "archived database must contain original event"
+        );
+
+        // 3. Fresh active DB can be initialized after reset
+        let fresh_db = HcomDb::open().expect("must open fresh database after reset");
+        let fresh_message_count: i64 = fresh_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("must query fresh events");
+        assert_eq!(
+            fresh_message_count, 0,
+            "fresh database must have cleared previous messages"
+        );
+        let reset_event_count: i64 = fresh_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'reset'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("must query reset event");
+        assert_eq!(
+            reset_event_count, 1,
+            "fresh database must contain initial reset event"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial_test::serial]
+    fn test_windows_reset_fails_safely_on_external_live_handle() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+
+        let db = HcomDb::open().expect("failed to open test database");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "2026-09-04T00:00:00Z",
+                    "message",
+                    "external_instance",
+                    "{\"content\":\"external\"}"
+                ],
+            )
+            .expect("failed to insert test event");
+
+        let db_path = hcom_dir.join("hcom.db");
+
+        // Simulate an uncooperative external process holding an open SQLite connection
+        let external_conn =
+            rusqlite::Connection::open(&db_path).expect("failed to open external connection");
+        let pre_event_count: i64 = external_conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("external connection must read initial state");
+        assert_eq!(
+            pre_event_count, 1,
+            "external connection must participate in current DB/WAL state"
+        );
+
+        let ctx = crate::shared::CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+        };
+        let reset_args = crate::commands::reset::ResetArgs { target: None };
+        let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
+        assert_ne!(
+            exit_code, 0,
+            "reset must fail when external process holds open handle"
+        );
+
+        // Verify original database file remains present and queryable through the external handle
+        assert!(
+            db_path.exists(),
+            "original database file must remain present when external handle blocks reset"
+        );
+        let event_count: i64 = external_conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("original database must remain readable through external connection");
+        assert_eq!(
+            event_count, 1,
+            "original database content must remain intact and not mutated by reset failure"
+        );
+
+        // Also independently verify through a fresh connection that on-disk DB is uncorrupted
+        let fresh_conn = rusqlite::Connection::open(&db_path)
+            .expect("failed to open fresh connection to original db");
+        let fresh_count: i64 = fresh_conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("fresh connection must read preserved original events");
+        assert_eq!(
+            fresh_count, 1,
+            "original database on disk must remain queryable with message count = 1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_unix_reset_handles_command_owned_connection() {
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+
+        let db = HcomDb::open().expect("failed to open test database");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "2026-09-04T00:00:00Z",
+                    "message",
+                    "test_instance",
+                    "{\"content\":\"test\"}"
+                ],
+            )
+            .expect("failed to insert test event");
+
+        let ctx = crate::shared::CommandContext {
+            explicit_name: None,
+            identity: None,
+            go: true,
+        };
+        let reset_args = crate::commands::reset::ResetArgs { target: None };
+        let exit_code = crate::commands::reset::cmd_reset(db, &reset_args, Some(&ctx));
+        assert_eq!(exit_code, 0);
+
+        let archive_base = hcom_dir.join("archive");
+        assert!(archive_base.exists());
+
+        let fresh_db = HcomDb::open().expect("must open fresh database after reset");
+        let fresh_message_count: i64 = fresh_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_message_count, 0);
     }
 }

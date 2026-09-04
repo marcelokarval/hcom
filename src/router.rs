@@ -862,9 +862,19 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => return crate::commands::reset::cmd_reset(db, &args, Some(&ctx)),
+            Err(e) => {
+                e.print().ok();
+                let code = if e.use_stderr() { 1 } else { 0 };
+                if let Some(output) =
+                    crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
+                {
+                    print!("{output}");
+                }
+                return code;
+            }
+        },
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
