@@ -476,23 +476,53 @@ pub fn send_message(
     Ok(delivery.delivered_to)
 }
 
-/// Resolve reply_to to local event ID. Returns None if not found.
+/// Resolve reply_to to local event ID. Returns None if not found or ambiguous.
 fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
-    // reply_to can be "42" or "42:BOXE" (remote)
-    let local_part = reply_to.split(':').next()?;
-    let id: i64 = local_part.parse().ok()?;
+    let reply_to = reply_to.trim();
+    if reply_to.is_empty() {
+        return None;
+    }
 
-    // Verify event exists and is a message
-    let exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
-            rusqlite::params![id],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
+    if let Some((origin_str, device_short)) = reply_to.split_once(':') {
+        if origin_str.is_empty() || device_short.is_empty() || device_short.contains(':') {
+            return None;
+        }
+        let origin_id: i64 = origin_str.parse().ok()?;
 
-    if exists { Some(id) } else { None }
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT id FROM events WHERE type = 'message' \
+                 AND CAST(json_extract(data, '$._relay.id') AS INTEGER) = ? \
+                 AND json_extract(data, '$._relay.short') = ? \
+                 LIMIT 2",
+            )
+            .ok()?;
+
+        let matching_ids: Vec<i64> = stmt
+            .query_map(rusqlite::params![origin_id, device_short], |row| row.get(0))
+            .ok()?
+            .flatten()
+            .collect();
+
+        if matching_ids.len() == 1 {
+            Some(matching_ids[0])
+        } else {
+            None
+        }
+    } else {
+        let local_id: i64 = reply_to.parse().ok()?;
+        let exists: bool = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
+                rusqlite::params![local_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if exists { Some(local_id) } else { None }
+    }
 }
 
 /// Get thread from an event (for --reply-to thread inheritance).
@@ -1732,5 +1762,229 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_remote_different_local_id() {
+        let (db, path, _env) = setup_test_db();
+        let data = serde_json::json!({
+            "text": "remote message",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                [data.to_string()],
+            )
+            .unwrap();
+        db.kv_set("relay_short_BOXE", Some("dev-uuid-boxe"))
+            .unwrap();
+
+        let resolved = resolve_reply_to_local(&db, "42:BOXE");
+        assert_eq!(resolved, Some(100));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_remote_colliding_local_id() {
+        let (db, path, _env) = setup_test_db();
+        let local_data = serde_json::json!({ "text": "unrelated local message" });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', 'local-inst', '2026-09-04T00:00:00Z', ?)",
+                [local_data.to_string()],
+            )
+            .unwrap();
+
+        let remote_data = serde_json::json!({
+            "text": "remote message",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                [remote_data.to_string()],
+            )
+            .unwrap();
+        db.kv_set("relay_short_BOXE", Some("dev-uuid-boxe"))
+            .unwrap();
+
+        // 42:BOXE must resolve to the remote event (100), never the colliding local event (42)
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), Some(100));
+        // local 42 without suffix must resolve to the local event (42)
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_two_devices_same_origin_id() {
+        let (db, path, _env) = setup_test_db();
+        let remote_data_1 = serde_json::json!({
+            "text": "remote message 1",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-1', '2026-09-04T00:00:00Z', ?)",
+                [remote_data_1.to_string()],
+            )
+            .unwrap();
+        db.kv_set("relay_short_BOXE", Some("dev-uuid-boxe"))
+            .unwrap();
+
+        let remote_data_2 = serde_json::json!({
+            "text": "remote message 2",
+            "_relay": {
+                "id": 42,
+                "short": "WAVE",
+                "device": "dev-uuid-wave"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (200, 'message', 'remote-2', '2026-09-04T00:00:00Z', ?)",
+                [remote_data_2.to_string()],
+            )
+            .unwrap();
+        db.kv_set("relay_short_WAVE", Some("dev-uuid-wave"))
+            .unwrap();
+
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), Some(100));
+        assert_eq!(resolve_reply_to_local(&db, "42:WAVE"), Some(200));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_unknown_device_fails_closed() {
+        let (db, path, _env) = setup_test_db();
+        let remote_data = serde_json::json!({
+            "text": "remote message",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                [remote_data.to_string()],
+            )
+            .unwrap();
+        db.kv_set("relay_short_BOXE", Some("dev-uuid-boxe"))
+            .unwrap();
+
+        assert_eq!(resolve_reply_to_local(&db, "42:NOPE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_duplicate_same_short_origin_fails_closed() {
+        let (db, path, _env) = setup_test_db();
+        let remote_data_1 = serde_json::json!({
+            "text": "remote message 1",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe-1"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-1', '2026-09-04T00:00:00Z', ?)",
+                [remote_data_1.to_string()],
+            )
+            .unwrap();
+
+        // Duplicate imported event with same origin ID 42 and same device short BOXE
+        let remote_data_2 = serde_json::json!({
+            "text": "remote message 2",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe-2"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (101, 'message', 'remote-2', '2026-09-04T00:00:00Z', ?)",
+                [remote_data_2.to_string()],
+            )
+            .unwrap();
+
+        // When multiple rows match (origin=42, short=BOXE), resolution must fail closed
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_malformed_tokens_fail_closed() {
+        let (db, path, _env) = setup_test_db();
+        let remote_data = serde_json::json!({
+            "text": "remote message",
+            "_relay": {
+                "id": 42,
+                "short": "BOXE",
+                "device": "dev-uuid-boxe"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (100, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                [remote_data.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(resolve_reply_to_local(&db, ""), None);
+        assert_eq!(resolve_reply_to_local(&db, "   "), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:"), None);
+        assert_eq!(resolve_reply_to_local(&db, ":BOXE"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE:EXTRA"), None);
+        assert_eq!(resolve_reply_to_local(&db, "abc:BOXE"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BO"), None); // Non-matching prefix fails closed
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_local_only_unchanged() {
+        let (db, path, _env) = setup_test_db();
+        let local_data = serde_json::json!({ "text": "local message" });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', 'local-inst', '2026-09-04T00:00:00Z', ?)",
+                [local_data.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+        assert_eq!(resolve_reply_to_local(&db, "999"), None);
+        assert_eq!(resolve_reply_to_local(&db, "notanumber"), None);
+
+        cleanup_test_db(path);
     }
 }
