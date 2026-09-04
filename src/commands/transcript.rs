@@ -2010,4 +2010,173 @@ mod tests {
             run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
         assert!(err.contains("was not found on PATH"));
     }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, transcript_path: &str, tool: &str) {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "created_at".into(),
+            json!(crate::shared::time::now_epoch_f64()),
+        );
+        data.insert("tool".into(), json!(tool));
+        data.insert("transcript_path".into(), json!(transcript_path));
+        db.save_instance_named(name, &data).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_underscore_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_testa = dir.path().join("testa1.jsonl");
+        fs::write(&p_testa, "").unwrap();
+        insert_test_instance(&db, "testa1", p_testa.to_str().unwrap(), "codex");
+
+        // Literal '_' in requested prefix must not match 'testa1' via SQL LIKE wildcard
+        let res = resolve_instance_transcript(&db, "test_");
+        assert_eq!(
+            res, None,
+            "literal '_' must not match 'testa1' via SQL wildcard"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_percent_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_fooa = dir.path().join("fooa1.jsonl");
+        fs::write(&p_fooa, "").unwrap();
+        insert_test_instance(&db, "fooa1", p_fooa.to_str().unwrap(), "codex");
+
+        // Literal '%' in requested prefix must not match 'fooa1' via SQL LIKE wildcard
+        let res = resolve_instance_transcript(&db, "foo%");
+        assert_eq!(
+            res, None,
+            "literal '%' must not match 'fooa1' via SQL wildcard"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_backslash_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_slash = dir.path().join("esc_slash.jsonl");
+        fs::write(&p_slash, "").unwrap();
+        insert_test_instance(&db, "esc\\1", p_slash.to_str().unwrap(), "codex");
+
+        // Literal backslash in prefix must resolve literal instance 'esc\1'
+        let res = resolve_instance_transcript(&db, "esc\\");
+        assert_eq!(
+            res.as_ref().map(|(n, _, _, _)| n.as_str()),
+            Some("esc\\1"),
+            "literal backslash prefix 'esc\\' must resolve to 'esc\\1'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_ambiguous_prefix_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p1 = dir.path().join("ambig_one.jsonl");
+        let p2 = dir.path().join("ambig_two.jsonl");
+        fs::write(&p1, "").unwrap();
+        fs::write(&p2, "").unwrap();
+
+        insert_test_instance(&db, "ambig_one", p1.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "ambig_two", p2.to_str().unwrap(), "codex");
+
+        // Multiple candidates matching prefix must fail closed (return None)
+        // rather than picking an arbitrary candidate based on SQLite row order
+        let resolved = resolve_instance_transcript(&db, "ambig_");
+        assert_eq!(
+            resolved, None,
+            "multiple prefix candidates must fail closed to avoid disclosing the wrong transcript"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_match_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_exact = dir.path().join("exact.jsonl");
+        let p_longer = dir.path().join("exact_one.jsonl");
+        fs::write(&p_exact, "").unwrap();
+        fs::write(&p_longer, "").unwrap();
+
+        insert_test_instance(&db, "exact", p_exact.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "exact_one", p_longer.to_str().unwrap(), "codex");
+
+        // Exact match must win immediately, without triggering prefix ambiguity
+        let resolved = resolve_instance_transcript(&db, "exact");
+        assert!(resolved.is_some(), "exact match must resolve");
+        let (name, path, tool, _) = resolved.unwrap();
+        assert_eq!(name, "exact");
+        assert_eq!(path, p_exact.to_str().unwrap());
+        assert_eq!(tool, "codex");
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_stopped_instance_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let session_dir = dir.path().join(".codex/sessions/sess-stopped-123");
+        fs::create_dir_all(&session_dir).unwrap();
+        let p_stopped = session_dir.join("rollout.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+
+        // Insert a stopped life event into the events table
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    "miso",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-stopped-123"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let res = resolve_instance_transcript(&db, "miso");
+        assert!(
+            res.is_some(),
+            "stopped instance should resolve via events table fallback"
+        );
+        let (name, path, tool, sid) = res.unwrap();
+        assert_eq!(name, "miso");
+        assert_eq!(path, p_stopped.to_str().unwrap());
+        assert_eq!(tool, "codex");
+        assert_eq!(sid.as_deref(), Some("sess-stopped-123"));
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_single_literal_prefix_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_sole = dir.path().join("sole_worker.jsonl");
+        fs::write(&p_sole, "").unwrap();
+        insert_test_instance(&db, "sole_worker", p_sole.to_str().unwrap(), "codex");
+
+        // A single unambiguous literal prefix must resolve to its sole candidate
+        let res = resolve_instance_transcript(&db, "sole_");
+        assert!(
+            res.is_some(),
+            "unambiguous single prefix match should resolve"
+        );
+        let (name, path, tool, _) = res.unwrap();
+        assert_eq!(name, "sole_worker");
+        assert_eq!(path, p_sole.to_str().unwrap());
+        assert_eq!(tool, "codex");
+    }
 }
