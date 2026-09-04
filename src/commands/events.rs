@@ -1442,4 +1442,200 @@ mod tests {
             _ => panic!("Expected Launch subcommand"),
         }
     }
+
+    fn setup_test_db() -> (tempfile::TempDir, HcomDb, HcomDb) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("events_wait_test.db");
+        let writer = HcomDb::open_raw(&db_path).unwrap();
+        writer.init_db().unwrap();
+        let reader = HcomDb::open_raw(&db_path).unwrap();
+        (temp_dir, writer, reader)
+    }
+
+    #[test]
+    fn test_events_wait_unrelated_unread_does_not_satisfy_filter() {
+        let (_temp, writer, reader) = setup_test_db();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES ('waiter', 'test', 'active', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let initial_cursor = writer.get_cursor("waiter");
+        assert_eq!(initial_cursor, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let filters = HashMap::new();
+            // Filter specifically expects a status event
+            let code = events_wait(
+                &reader,
+                " AND (type = 'status')",
+                5,
+                false,
+                &filters,
+                Some("waiter"),
+            );
+            tx.send(code).unwrap();
+        });
+
+        // Poll until notify endpoint is registered, ensuring events_wait is actively listening
+        for _ in 0..100 {
+            if writer.has_notify_endpoint_kind("waiter", "events_wait") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(writer.has_notify_endpoint_kind("waiter", "events_wait"));
+
+        // Deliver an unrelated unread message event (type = 'message', not 'status')
+        let msg_data = json!({
+            "from": "sender",
+            "text": "hello",
+            "scope": "broadcast",
+        });
+        writer
+            .log_event_with_ts("message", "sender", &msg_data, None)
+            .unwrap();
+        crate::notify::wake(&writer, "waiter", &[crate::notify::WakeKind::EventsWait]);
+
+        // Buggy behavior: events_wait breaks 0 on unrelated unread message.
+        // Expected behavior: events_wait must NOT break 0; it must remain pending.
+        let pending = rx.recv_timeout(Duration::from_millis(250));
+        assert!(
+            pending.is_err(),
+            "events_wait must not break with 0 on an unrelated unread message; got: {:?}",
+            pending
+        );
+
+        // Verify that the unread message check did not advance the delivery cursor
+        let cursor_after_unrelated = writer.get_cursor("waiter");
+        assert_eq!(cursor_after_unrelated, initial_cursor);
+
+        // Inject matching event (type = 'status')
+        let status_data = json!({
+            "status": "active",
+            "detail": "ready",
+        });
+        writer
+            .log_event_with_ts("status", "waiter", &status_data, None)
+            .unwrap();
+        crate::notify::wake(&writer, "waiter", &[crate::notify::WakeKind::EventsWait]);
+
+        // With a matching event, events_wait must wake and exit 0
+        let exit_code = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("events_wait must exit 0 on matching event");
+        assert_eq!(exit_code, 0);
+
+        handle.join().unwrap();
+
+        // Notify endpoint must be cleaned up upon exit
+        assert!(!writer.has_notify_endpoint_kind("waiter", "events_wait"));
+    }
+
+    #[test]
+    fn test_events_wait_preexisting_unrelated_unread_does_not_satisfy_filter() {
+        let (_temp, writer, reader) = setup_test_db();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES ('pre_agent', 'test', 'active', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Deliver an unrelated unread message beforehand
+        let msg_data = json!({
+            "from": "sender",
+            "text": "old unread message",
+            "scope": "broadcast",
+        });
+        writer
+            .log_event_with_ts("message", "sender", &msg_data, None)
+            .unwrap();
+
+        let initial_cursor = writer.get_cursor("pre_agent");
+        assert_eq!(initial_cursor, 0);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let filters = HashMap::new();
+            let code = events_wait(
+                &reader,
+                " AND (type = 'status')",
+                1,
+                false,
+                &filters,
+                Some("pre_agent"),
+            );
+            tx.send(code).unwrap();
+        });
+
+        // Buggy behavior: exits 0 immediately because unread message is present.
+        // Expected behavior: ignores unrelated unread message for filter matching, times out with 1.
+        let result = rx.recv_timeout(Duration::from_millis(250));
+        assert!(
+            result.is_err(),
+            "events_wait must not break with 0 on pre-existing unrelated unread message; got: {:?}",
+            result
+        );
+
+        let code = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("events_wait must time out");
+        assert_eq!(code, 1);
+        handle.join().unwrap();
+        assert_eq!(writer.get_cursor("pre_agent"), initial_cursor);
+    }
+
+    #[test]
+    fn test_events_wait_timeout_returns_one() {
+        let (_temp, writer, reader) = setup_test_db();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES ('timeout_agent', 'test', 'active', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let filters = HashMap::new();
+        let code = events_wait(
+            &reader,
+            " AND (type = 'nonexistent')",
+            1,
+            false,
+            &filters,
+            Some("timeout_agent"),
+        );
+        assert_eq!(code, 1);
+        assert!(!writer.has_notify_endpoint_kind("timeout_agent", "events_wait"));
+    }
+
+    #[test]
+    fn test_events_wait_invalid_sql_returns_two() {
+        let (_temp, writer, reader) = setup_test_db();
+        writer
+            .conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES ('sql_agent', 'test', 'active', 1000.0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let filters = HashMap::new();
+        let code = events_wait(
+            &reader,
+            " AND (invalid sql %%%)",
+            1,
+            false,
+            &filters,
+            Some("sql_agent"),
+        );
+        assert_eq!(code, 2);
+        assert!(!writer.has_notify_endpoint_kind("sql_agent", "events_wait"));
+    }
 }
