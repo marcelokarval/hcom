@@ -2179,4 +2179,56 @@ mod tests {
         assert_eq!(path, p_sole.to_str().unwrap());
         assert_eq!(tool, "codex");
     }
+
+    #[test]
+    fn test_resolve_instance_transcript_stopped_instance_preempts_ambiguous_prefix_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        // Two active prefix candidates starting with "pico_"
+        let p_active1 = dir.path().join("pico_one.jsonl");
+        let p_active2 = dir.path().join("pico_two.jsonl");
+        fs::write(&p_active1, "").unwrap();
+        fs::write(&p_active2, "").unwrap();
+        insert_test_instance(&db, "pico_one", p_active1.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "pico_two", p_active2.to_str().unwrap(), "codex");
+
+        // One stopped instance whose exact name matches input "pico"
+        let session_dir = dir.path().join(".codex/sessions/sess-pico-stopped");
+        fs::create_dir_all(&session_dir).unwrap();
+        let p_stopped = session_dir.join("rollout.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    "pico",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-pico-stopped"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let res = resolve_instance_transcript(&db, "pico");
+        assert!(
+            res.is_some(),
+            "exact stopped instance must resolve when active prefix candidates are ambiguous"
+        );
+        let (name, path, tool, sid) = res.unwrap();
+        assert_eq!(
+            name, "pico",
+            "must resolve stopped instance, not an active prefix candidate"
+        );
+        assert_eq!(path, p_stopped.to_str().unwrap());
+        assert_eq!(tool, "codex");
+        assert_eq!(sid.as_deref(), Some("sess-pico-stopped"));
+    }
 }
