@@ -343,14 +343,39 @@ mod tests {
         let reset_event_count: i64 = fresh_db
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE type = 'reset'",
+                "SELECT COUNT(*) FROM events WHERE type = 'life' AND instance = '_device'",
                 [],
                 |r| r.get(0),
             )
-            .expect("must query reset event");
+            .expect("must query life/_device reset event");
         assert_eq!(
             reset_event_count, 1,
-            "fresh database must contain initial reset event"
+            "fresh database must contain initial life/_device reset event"
+        );
+
+        let reset_data_raw: String = fresh_db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = '_device' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("must query reset event data");
+        let reset_data: serde_json::Value =
+            serde_json::from_str(&reset_data_raw).expect("reset event data must be valid JSON");
+        assert_eq!(
+            reset_data.get("action").and_then(|v| v.as_str()),
+            Some("reset"),
+            "life/_device event action must be 'reset'"
+        );
+
+        let relay_reset_ts = fresh_db
+            .kv_get("relay_local_reset_ts")
+            .expect("must query relay_local_reset_ts")
+            .expect("relay_local_reset_ts must be present after reset");
+        assert!(
+            !relay_reset_ts.trim().is_empty(),
+            "relay_local_reset_ts must not be empty"
         );
     }
 
