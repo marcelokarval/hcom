@@ -2032,6 +2032,11 @@ mod tests {
             None,
         );
 
+        let count_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
         // Unknown device
         let mut args_unknown = SendArgs::try_parse_from([
             "send",
@@ -2076,6 +2081,12 @@ mod tests {
         .unwrap();
         args_nonexistent.had_separator = true;
         assert_eq!(cmd_send(&db, &args_nonexistent, None), 1);
+
+        let count_after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, count_after);
 
         cleanup_test_db(path);
     }
